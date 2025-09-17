@@ -5,6 +5,10 @@ export interface ParsedDoc {
 }
 
 export function parseRawDocComment(raw: string): ParsedDoc {
+  // Parse a /** ... */ block with simple heuristics:
+  // - Concatenate non-@ lines into description
+  // - Extract @param <name> <desc>
+  // - Extract @returns <desc>
   const lines = raw.split(/\r?\n/);
   const params: Record<string, string> = {};
   const descriptionLines: string[] = [];
@@ -46,6 +50,8 @@ export function parseRawDocComment(raw: string): ParsedDoc {
 }
 
 export function extractDocCommentAbove(lines: string[], decoratorLine: number): string | undefined {
+  // Starting just above a decorator line, walk upwards to find the nearest
+  // /** ... */ block and return it as a single string, if present.
   let i = decoratorLine - 2; // above decorator; indices are 0-based
   while (i >= 0) {
     const line = lines[i];

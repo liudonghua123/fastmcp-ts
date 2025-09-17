@@ -1,3 +1,4 @@
+// Enable runtime metadata storage used by decorators below
 import 'reflect-metadata';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -20,7 +21,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { parseRawDocComment, extractDocCommentAbove } from './doc-utils.js';
 
-// Metadata keys for storing decorator information
+// Unique metadata keys for reflect-metadata
 const TOOL_METADATA_KEY = Symbol('tool');
 const PROMPT_METADATA_KEY = Symbol('prompt');
 const RESOURCE_METADATA_KEY = Symbol('resource');
@@ -84,12 +85,13 @@ interface ResourceMetadata extends ResourceOptions {
   target: any;
 }
 
-// Storage for metadata
+// In-memory stores keyed by class constructor. Decorators populate these
+// so FastMCP can enumerate all tools/prompts/resources when registering.
 const toolsMetadata = new Map<any, ToolMetadata[]>();
 const promptsMetadata = new Map<any, PromptMetadata[]>();
 const resourcesMetadata = new Map<any, ResourceMetadata[]>();
 
-// Cache file lines to avoid repeated disk reads for multiple decorators
+// Cache source file lines for doc parsing (avoid repeated IO)
 const fileLinesCache = new Map<string, string[]>();
 
 const pinoOptions: pino.LoggerOptions = {
@@ -102,6 +104,7 @@ console.info(pinoOptions)
 const logger = pino(pinoOptions);
 
 function normalizePath(p: string): string {
+  // VS Code/Node stacks may use file:/// URLs; normalize to OS path
   // convert file:///D:/... to D:\... on Windows
   if (p.startsWith('file:///')) {
     const url = new URL(p);
@@ -111,7 +114,7 @@ function normalizePath(p: string): string {
 }
 
 function remapJsToTs(filePath: string): string {
-  // Heuristic: dist/*.js -> src/*.ts
+  // Heuristic mapping: dist/*.js -> src/*.ts to find docs in TS
   if (filePath.endsWith('.js')) {
     const tsPath = filePath
       .replace(/(^|[\\/])dist([\\/])/, '$1src$2')
@@ -137,6 +140,8 @@ function getFileLines(filePath: string): string[] | undefined {
 }
 
 function getCallsiteFileFromStack(): string | undefined {
+  // Capture a stack and pick the first user-code frame (not node_modules
+  // or this file). Used to locate doc blocks for inference.
   const old = Error.prepareStackTrace;
   try {
     Error.prepareStackTrace = (_err: any, stack: any[]) => stack;
@@ -167,7 +172,7 @@ function getCallsiteFileFromStack(): string | undefined {
   return undefined;
 }
 
-// Helper function to get or create metadata array
+// Helper: ensure a metadata array exists for a given target
 function getOrCreateMetadata<T>(map: Map<any, T[]>, target: any): T[] {
   if (!map.has(target)) {
     map.set(target, []);
@@ -176,42 +181,46 @@ function getOrCreateMetadata<T>(map: Map<any, T[]>, target: any): T[] {
 }
 
 /**
- * Tool decorator for marking methods as MCP tools
+ * Tool decorator for marking methods as MCP tools.
+ * Supports both usages:
+ * - @tool()                // with parentheses (factory)
+ * - @tool                  // without parentheses (no options)
  */
-export function tool(options: ToolOptions = {}) {
-  return function (target: any, propertyKey: string, _descriptor: PropertyDescriptor) {
+export function tool(options?: ToolOptions): MethodDecorator;
+export function tool(target: any, propertyKey: string, descriptor: PropertyDescriptor): void;
+export function tool(...args: any[]): any {
+  // Legacy decorator semantics (TS experimentalDecorators)
+  const applyLegacy = (target: any, propertyKey: string | symbol, _descriptor: PropertyDescriptor, options: ToolOptions = {}) => {
     logger.debug({ class: target?.constructor?.name, method: propertyKey, options }, 'tool decorator invoked');
     const metadata: ToolMetadata = {
-      name: options.name || propertyKey,
+      name: options.name || String(propertyKey),
       description: options.description || '',
       parameters: options.parameters || z.any(),
-      methodName: propertyKey,
+      methodName: String(propertyKey),
       target: target.constructor
     };
 
-    // Parse doc comments if either description or parameters may be inferred
-    const needDocForDescription = options.description === undefined;
+  // Optionally infer description/parameters from adjacent doc block
+  const needDocForDescription = options.description === undefined;
     const needDocForParams = options.parameters === undefined;
     if (needDocForDescription || needDocForParams) {
       try {
         const frameFile = getCallsiteFileFromStack();
-  logger.debug({ env: process.env['NODE_ENV'], argv: process.argv, execPath: process.execPath }, 'Environment snapshot');
+        logger.debug({ env: process.env['NODE_ENV'], argv: process.argv, execPath: process.execPath }, 'Environment snapshot');
         if (frameFile) {
           const lines = getFileLines(frameFile);
           if (lines) {
-            // Find the method definition line first
             let methodLineIndex = -1;
-            const methodRe = new RegExp(`(^|\\b)(async\\s+)?${propertyKey}\\s*\\(`);
+            const methodRe = new RegExp(`(^|\\b)(async\\s+)?${String(propertyKey)}\\s*\\(`);
             for (let i = 0; i < lines.length; i++) {
               const l = lines[i] || '';
               if (methodRe.test(l)) { methodLineIndex = i; break; }
             }
-            // Walk upward to the nearest @tool( before the method
-            let decoratorIndex = -1;
+            let decoratorIndex = -1; // line where @tool/() is applied
             if (methodLineIndex >= 0) {
               for (let i = methodLineIndex - 1; i >= 0; i--) {
                 const l = lines[i] || '';
-                if (l.includes('@tool(')) { decoratorIndex = i; break; }
+                if (/\@tool\s*\(/.test(l) || /\@tool\b(?!\s*\()/.test(l)) { decoratorIndex = i; break; }
                 if (/^(\s*(public|private|protected)\s+)?(async\s+)?\w+\s*\(/.test(l)) break;
               }
             }
@@ -223,7 +232,6 @@ export function tool(options: ToolOptions = {}) {
                 const parsed = parseRawDocComment(docRaw);
                 logger.debug({ parsed }, 'Parsed doc comment');
                 if (needDocForDescription && parsed.description) metadata.description = parsed.description;
-                // Infer parameters if not provided
                 if (needDocForParams && parsed.params) {
                   const shape: Record<string, z.ZodTypeAny> = {};
                   for (const [param, desc] of Object.entries(parsed.params)) {
@@ -244,13 +252,120 @@ export function tool(options: ToolOptions = {}) {
         // best effort; ignore failures
       }
     }
-    
-  const tools = getOrCreateMetadata(toolsMetadata, target.constructor);
+
+    const tools = getOrCreateMetadata(toolsMetadata, target.constructor);
     tools.push(metadata);
-  logger.debug({ metadata }, 'Registered tool metadata');
-    
-    // Store metadata using reflect-metadata as well for additional access
-    Reflect.defineMetadata(TOOL_METADATA_KEY, metadata, target, propertyKey);
+    logger.debug({ metadata }, 'Registered tool metadata');
+    Reflect.defineMetadata(TOOL_METADATA_KEY, metadata, target, String(propertyKey));
+  };
+
+  // Stage-3 decorator semantics (TC39 proposal, TS 5+)
+  const applyStandard = (value: any, context: any, options: ToolOptions = {}) => {
+    // context: ClassMethodDecoratorContext (proposal)
+    if (!context || context.kind !== 'method') return;
+    const name = String(context.name);
+  // Runs when class is initialized; allows instance-related registration
+  context.addInitializer(function (this: any) {
+      const target = this.constructor.prototype;
+      logger.debug({ class: this?.constructor?.name, method: name, options }, 'tool decorator (standard) initialized');
+      const metadata: ToolMetadata = {
+        name: options.name || name,
+        description: options.description || '',
+        parameters: options.parameters || z.any(),
+        methodName: name,
+        target: this.constructor
+      };
+
+  // Try to infer missing description/parameters from doc comments
+  const needDocForDescription = options.description === undefined;
+      const needDocForParams = options.parameters === undefined;
+      if (needDocForDescription || needDocForParams) {
+        try {
+          const frameFile = getCallsiteFileFromStack();
+          logger.debug({ env: process.env['NODE_ENV'], argv: process.argv, execPath: process.execPath }, 'Environment snapshot');
+          if (frameFile) {
+            const lines = getFileLines(frameFile);
+            if (lines) {
+              let methodLineIndex = -1;
+              const methodRe = new RegExp(`(^|\\b)(async\\s+)?${name}\\s*\\(`);
+              for (let i = 0; i < lines.length; i++) {
+                const l = lines[i] || '';
+                if (methodRe.test(l)) { methodLineIndex = i; break; }
+              }
+              let decoratorIndex = -1;
+              if (methodLineIndex >= 0) {
+                for (let i = methodLineIndex - 1; i >= 0; i--) {
+                  const l = lines[i] || '';
+                  if (/\@tool\s*\(/.test(l) || /\@tool\b(?!\s*\()/.test(l)) { decoratorIndex = i; break; }
+                  if (/^(\s*(public|private|protected)\s+)?(async\s+)?\w+\s*\(/.test(l)) break;
+                }
+              }
+              logger.debug({ frameFile, methodLineIndex, decoratorIndex }, 'Decorator scan result');
+              if (decoratorIndex >= 0) {
+                const docRaw = extractDocCommentAbove(lines, decoratorIndex + 1);
+                logger.debug({ hasDoc: !!docRaw }, 'Doc comment presence');
+                if (docRaw) {
+                  const parsed = parseRawDocComment(docRaw);
+                  logger.debug({ parsed }, 'Parsed doc comment');
+                  if (needDocForDescription && parsed.description) metadata.description = parsed.description;
+                  if (needDocForParams && parsed.params) {
+                    const shape: Record<string, z.ZodTypeAny> = {};
+                    for (const [param, desc] of Object.entries(parsed.params)) {
+                      if (/number/i.test(desc)) shape[param] = z.number();
+                      else if (/boolean|true|false/i.test(desc)) shape[param] = z.boolean();
+                      else if (/array|list|items/i.test(desc)) shape[param] = z.array(z.any());
+                      else shape[param] = z.string();
+                    }
+                    if (Object.keys(shape).length) {
+                      metadata.parameters = z.object(shape);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const tools = getOrCreateMetadata(toolsMetadata, this.constructor);
+      tools.push(metadata);
+      logger.debug({ metadata }, 'Registered tool metadata (standard)');
+      Reflect.defineMetadata(TOOL_METADATA_KEY, metadata, target, name);
+    });
+
+    return value; // no method replacement
+  };
+
+  // Detect legacy vs standard direct-application decorator forms
+  const isLegacyDirect = (a: any[]): a is [any, string | symbol, PropertyDescriptor] =>
+    a.length === 3 && (typeof a[1] === 'string' || typeof a[1] === 'symbol');
+
+  const isStandardDirect = (a: any[]): a is [any, { kind: string } ] =>
+    a.length === 2 && a[1] && typeof a[1] === 'object' && 'kind' in a[1];
+
+  // Direct decorator usage: @tool
+  if (isLegacyDirect(args)) {
+    const [target, propertyKey, descriptor] = args;
+    return applyLegacy(target, propertyKey, descriptor, {});
+  }
+  if (isStandardDirect(args)) {
+    const [value, context] = args;
+    return applyStandard(value, context, {});
+  }
+
+  // Factory usage: @tool() or @tool({...})
+  const options: ToolOptions = (args[0] ?? {}) as ToolOptions;
+  return (...decArgs: any[]) => {
+    if (isLegacyDirect(decArgs)) {
+      const [target, propertyKey, descriptor] = decArgs;
+      return applyLegacy(target, propertyKey, descriptor, options);
+    }
+    if (isStandardDirect(decArgs)) {
+      const [value, context] = decArgs;
+      return applyStandard(value, context, options);
+    }
   };
 }
 
@@ -320,29 +435,73 @@ export class FastMCP {
    * Register a class instance containing decorated methods
    */
   register(instance: any) {
+    // Wire up an instance so its decorators become MCP handlers
     const constructor = instance.constructor;
     this.instances.set(constructor, instance);
     
     // Register tools from this instance
-    const tools = toolsMetadata.get(constructor) || [];
+    let tools = toolsMetadata.get(constructor) || [];
+    if (tools.length === 0) {
+      // Fallback: scan reflect-metadata if in-memory store wasn't filled
+      const proto = Object.getPrototypeOf(instance);
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        if (key === 'constructor') continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, key);
+        if (!desc || typeof desc.value !== 'function') continue;
+        const meta = Reflect.getMetadata(TOOL_METADATA_KEY, proto, key) as ToolMetadata | undefined;
+        if (meta) {
+          if (!meta.methodName) (meta as any).methodName = key;
+          tools = [...tools, meta];
+        }
+      }
+    }
     for (const toolMeta of tools) {
       this.registerTool(toolMeta, instance);
     }
     
     // Register prompts from this instance
-    const prompts = promptsMetadata.get(constructor) || [];
+    let prompts = promptsMetadata.get(constructor) || [];
+    if (prompts.length === 0) {
+      // Fallback: reflect-metadata scan
+      const proto = Object.getPrototypeOf(instance);
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        if (key === 'constructor') continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, key);
+        if (!desc || typeof desc.value !== 'function') continue;
+        const meta = Reflect.getMetadata(PROMPT_METADATA_KEY, proto, key) as PromptMetadata | undefined;
+        if (meta) {
+          if (!meta.methodName) (meta as any).methodName = key;
+          prompts = [...prompts, meta];
+        }
+      }
+    }
     for (const promptMeta of prompts) {
       this.registerPrompt(promptMeta, instance);
     }
     
     // Register resources from this instance
-    const resources = resourcesMetadata.get(constructor) || [];
+    let resources = resourcesMetadata.get(constructor) || [];
+    if (resources.length === 0) {
+      // Fallback: reflect-metadata scan
+      const proto = Object.getPrototypeOf(instance);
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        if (key === 'constructor') continue;
+        const desc = Object.getOwnPropertyDescriptor(proto, key);
+        if (!desc || typeof desc.value !== 'function') continue;
+        const meta = Reflect.getMetadata(RESOURCE_METADATA_KEY, proto, key) as ResourceMetadata | undefined;
+        if (meta) {
+          if (!meta.methodName) (meta as any).methodName = key;
+          resources = [...resources, meta];
+        }
+      }
+    }
     for (const resourceMeta of resources) {
       this.registerResource(resourceMeta, instance);
     }
   }
 
   private registerTool(toolMeta: ToolMetadata, instance: any) {
+    // Install CallTool handler which dispatches by tool name
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === toolMeta.name) {
         try {
@@ -363,7 +522,7 @@ export class FastMCP {
           }
           logger.debug({ name: toolMeta.name, rawArgs, parsedArgs }, 'Tool call args');
           
-          // Call the decorated method
+          // Invoke the decorated method and serialize result
           const result = await instance[toolMeta.methodName](parsedArgs);
           logger.debug({ name: toolMeta.name, resultType: typeof result }, 'Tool call result');
           
@@ -398,6 +557,7 @@ export class FastMCP {
   }
 
   private registerPrompt(promptMeta: PromptMetadata, instance: any) {
+    // Install GetPrompt handler returning a single user message
     this.server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       if (request.params.name === promptMeta.name) {
         try {
@@ -429,6 +589,7 @@ export class FastMCP {
   }
 
   private registerResource(resourceMeta: ResourceMetadata, instance: any) {
+    // Install ReadResource handler with string/regex URI matching
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       const uri = request.params.uri;
       let matches = false;
@@ -461,7 +622,7 @@ export class FastMCP {
   }
 
   private setupHandlers() {
-    // List tools handler
+    // List tools handler: expose all registered tools and schemas
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools: any[] = [];
       
@@ -478,7 +639,7 @@ export class FastMCP {
       return { tools };
     });
 
-    // List prompts handler
+  // List prompts handler
     this.server.setRequestHandler(ListPromptsRequestSchema, async () => {
       const prompts: any[] = [];
       
@@ -495,7 +656,7 @@ export class FastMCP {
       return { prompts };
     });
 
-    // List resources handler
+  // List resources handler
     this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
       const resources: any[] = [];
       
@@ -519,6 +680,7 @@ export class FastMCP {
    * @param transportConfig Transport configuration or defaults to stdio
    */
   async serve(transportConfig?: TransportConfig) {
+    // Choose transport and connect MCP server
     const config = transportConfig || { type: 'stdio' };
     this.transport = this.createTransport(config);
     await this.server.connect(this.transport);
@@ -537,6 +699,7 @@ export class FastMCP {
    * Create transport based on configuration
    */
   public createTransport(config: TransportConfig) {
+    // Map configuration to concrete transport implementation
     switch (config.type) {
       case 'stdio':
         return new StdioServerTransport();

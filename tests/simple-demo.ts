@@ -11,7 +11,7 @@ class SimpleMcp {
    * @param b Second number
    * @returns Sum of a and b
    */
-  @tool()
+  @tool
   async add({ a, b }: { a: number; b: number }) {
     return a + b;
   }
@@ -40,7 +40,7 @@ class OtherMap {
    * Simple other tool
    * @returns a string
    */
-  @tool()
+  @tool
   async other() {
     return "other";
   }
