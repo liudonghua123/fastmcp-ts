@@ -3,17 +3,49 @@
   "version": "0.1.0",
   "description": "typescript version of fastmcp for node",
   "main": "dist/index.js",
+  "module": "dist/index.js",
   "type": "module",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "src/*": ["src/*"],
+      "dist/*": ["dist/*"]
+    }
+  },
   "scripts": {
     "build": "npm run build:src && npm run build:tests",
     "build:src": "tsc -p tsconfig.src.json",
     "build:tests": "tsc -p tsconfig.tests.json",
     "dev": "tsc -p tsconfig.src.json --watch",
     "test": "node dist/test/my-mcp-server.js",
-    "start": "node dist/test/my-mcp-server.js"
+    "start": "node dist/test/my-mcp-server.js",
+    "prepare": "npm run build"
   },
-  "author": "",
+  "author": "liudonghua123",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liudonghua123/fastmcp-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liudonghua123/fastmcp-ts/issues"
+  },
+  "homepage": "https://github.com/liudonghua123/fastmcp-ts#readme",
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^20.19.15",
