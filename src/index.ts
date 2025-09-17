@@ -15,6 +15,10 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { ServerResponse } from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import pino from 'pino';
+import { parseRawDocComment, extractDocCommentAbove } from './doc-utils.js';
 
 // Metadata keys for storing decorator information
 const TOOL_METADATA_KEY = Symbol('tool');
@@ -23,9 +27,9 @@ const RESOURCE_METADATA_KEY = Symbol('resource');
 
 // Type definitions
 export interface ToolOptions {
-  name: string;
-  description: string;
-  parameters: z.ZodSchema<any>;
+  name?: string;
+  description?: string;
+  parameters?: z.ZodSchema<any>;
 }
 
 export interface PromptOptions {
@@ -62,7 +66,10 @@ export interface StreamableHTTPTransportConfig {
 
 export type TransportConfig = StdioTransportConfig | SSETransportConfig | StreamableHTTPTransportConfig;
 
-interface ToolMetadata extends ToolOptions {
+interface ToolMetadata {
+  name: string;
+  description: string;
+  parameters: z.ZodSchema<any>;
   methodName: string;
   target: any;
 }
@@ -82,6 +89,84 @@ const toolsMetadata = new Map<any, ToolMetadata[]>();
 const promptsMetadata = new Map<any, PromptMetadata[]>();
 const resourcesMetadata = new Map<any, ResourceMetadata[]>();
 
+// Cache file lines to avoid repeated disk reads for multiple decorators
+const fileLinesCache = new Map<string, string[]>();
+
+const pinoOptions: pino.LoggerOptions = {
+  level: process.env['FASTMCP_LOG_LEVEL'] || process.env['LOG_LEVEL'] || 'info',
+};
+if (process.env['PINO_PRETTY']) {
+  (pinoOptions as any).transport = { target: 'pino-pretty', options: { colorize: true } };
+}
+console.info(pinoOptions)
+const logger = pino(pinoOptions);
+
+function normalizePath(p: string): string {
+  // convert file:///D:/... to D:\... on Windows
+  if (p.startsWith('file:///')) {
+    const url = new URL(p);
+    return path.normalize(url.pathname.replace(/^\//, ''));
+  }
+  return path.normalize(p);
+}
+
+function remapJsToTs(filePath: string): string {
+  // Heuristic: dist/*.js -> src/*.ts
+  if (filePath.endsWith('.js')) {
+    const tsPath = filePath
+      .replace(/(^|[\\/])dist([\\/])/, '$1src$2')
+      .replace(/\.js$/, '.ts');
+    if (fs.existsSync(tsPath)) return tsPath;
+  }
+  return filePath;
+}
+
+function getFileLines(filePath: string): string[] | undefined {
+  const key = path.normalize(filePath);
+  if (fileLinesCache.has(key)) return fileLinesCache.get(key);
+  try {
+    const text = fs.readFileSync(key, 'utf8');
+    const lines = text.split(/\r?\n/);
+    fileLinesCache.set(key, lines);
+    logger.debug({ filePath: key, lineCount: lines.length }, 'Loaded file lines');
+    return lines;
+  } catch {
+    logger.debug({ filePath: key }, 'Failed to read file for lines');
+    return undefined;
+  }
+}
+
+function getCallsiteFileFromStack(): string | undefined {
+  const old = Error.prepareStackTrace;
+  try {
+    Error.prepareStackTrace = (_err: any, stack: any[]) => stack;
+    const err = new Error();
+    const stack = (err as any).stack as any[];
+    if (Array.isArray(stack)) {
+      logger.debug({ frames: stack.length }, 'Captured stack frames');
+      for (const frame of stack) {
+        const fileName: string | undefined = frame && typeof frame.getFileName === 'function' ? frame.getFileName() : undefined;
+        if (!fileName) continue;
+        const norm = normalizePath(fileName);
+        if (
+          !norm.includes(`${path.sep}node_modules${path.sep}`) &&
+          !norm.endsWith(`${path.sep}src${path.sep}index.ts`) &&
+          !norm.endsWith(`${path.sep}dist${path.sep}index.js`)
+        ) {
+          const mapped = remapJsToTs(norm);
+          logger.debug({ fileName, norm, mapped }, 'Selected callsite file');
+          return mapped;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  } finally {
+    Error.prepareStackTrace = old as any;
+  }
+  return undefined;
+}
+
 // Helper function to get or create metadata array
 function getOrCreateMetadata<T>(map: Map<any, T[]>, target: any): T[] {
   if (!map.has(target)) {
@@ -93,16 +178,76 @@ function getOrCreateMetadata<T>(map: Map<any, T[]>, target: any): T[] {
 /**
  * Tool decorator for marking methods as MCP tools
  */
-export function tool(options: ToolOptions) {
+export function tool(options: ToolOptions = {}) {
   return function (target: any, propertyKey: string, _descriptor: PropertyDescriptor) {
+    logger.debug({ class: target?.constructor?.name, method: propertyKey, options }, 'tool decorator invoked');
     const metadata: ToolMetadata = {
-      ...options,
+      name: options.name || propertyKey,
+      description: options.description || '',
+      parameters: options.parameters || z.any(),
       methodName: propertyKey,
       target: target.constructor
     };
+
+    // Parse doc comments if either description or parameters may be inferred
+    const needDocForDescription = options.description === undefined;
+    const needDocForParams = options.parameters === undefined;
+    if (needDocForDescription || needDocForParams) {
+      try {
+        const frameFile = getCallsiteFileFromStack();
+  logger.debug({ env: process.env['NODE_ENV'], argv: process.argv, execPath: process.execPath }, 'Environment snapshot');
+        if (frameFile) {
+          const lines = getFileLines(frameFile);
+          if (lines) {
+            // Find the method definition line first
+            let methodLineIndex = -1;
+            const methodRe = new RegExp(`(^|\\b)(async\\s+)?${propertyKey}\\s*\\(`);
+            for (let i = 0; i < lines.length; i++) {
+              const l = lines[i] || '';
+              if (methodRe.test(l)) { methodLineIndex = i; break; }
+            }
+            // Walk upward to the nearest @tool( before the method
+            let decoratorIndex = -1;
+            if (methodLineIndex >= 0) {
+              for (let i = methodLineIndex - 1; i >= 0; i--) {
+                const l = lines[i] || '';
+                if (l.includes('@tool(')) { decoratorIndex = i; break; }
+                if (/^(\s*(public|private|protected)\s+)?(async\s+)?\w+\s*\(/.test(l)) break;
+              }
+            }
+            logger.debug({ frameFile, methodLineIndex, decoratorIndex }, 'Decorator scan result');
+            if (decoratorIndex >= 0) {
+              const docRaw = extractDocCommentAbove(lines, decoratorIndex + 1);
+              logger.debug({ hasDoc: !!docRaw }, 'Doc comment presence');
+              if (docRaw) {
+                const parsed = parseRawDocComment(docRaw);
+                logger.debug({ parsed }, 'Parsed doc comment');
+                if (needDocForDescription && parsed.description) metadata.description = parsed.description;
+                // Infer parameters if not provided
+                if (needDocForParams && parsed.params) {
+                  const shape: Record<string, z.ZodTypeAny> = {};
+                  for (const [param, desc] of Object.entries(parsed.params)) {
+                    if (/number/i.test(desc)) shape[param] = z.number();
+                    else if (/boolean|true|false/i.test(desc)) shape[param] = z.boolean();
+                    else if (/array|list|items/i.test(desc)) shape[param] = z.array(z.any());
+                    else shape[param] = z.string();
+                  }
+                  if (Object.keys(shape).length) {
+                    metadata.parameters = z.object(shape);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // best effort; ignore failures
+      }
+    }
     
-    const tools = getOrCreateMetadata(toolsMetadata, target.constructor);
+  const tools = getOrCreateMetadata(toolsMetadata, target.constructor);
     tools.push(metadata);
+  logger.debug({ metadata }, 'Registered tool metadata');
     
     // Store metadata using reflect-metadata as well for additional access
     Reflect.defineMetadata(TOOL_METADATA_KEY, metadata, target, propertyKey);
@@ -201,17 +346,38 @@ export class FastMCP {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === toolMeta.name) {
         try {
-          // Parse and validate parameters using the zod schema
-          const parsedArgs = toolMeta.parameters.parse(request.params.arguments || {});
+          let rawArgs = request.params.arguments || {};
+          // Fallback: if arguments missing but other params exist (excluding reserved keys), use them
+          if (!rawArgs || (typeof rawArgs === 'object' && Object.keys(rawArgs).length === 0)) {
+            const { name, ...rest } = (request.params as any) || {};
+            if (rest && Object.keys(rest).length) rawArgs = rest;
+          }
+          let parsedArgs: any;
+          if (toolMeta.parameters instanceof z.ZodObject && Object.keys(toolMeta.parameters.shape).length === 0) {
+            // Empty object schema - pass through raw args
+            parsedArgs = rawArgs;
+          } else if (toolMeta.parameters instanceof z.ZodAny) {
+            parsedArgs = rawArgs;
+          } else {
+            parsedArgs = toolMeta.parameters.parse(rawArgs);
+          }
+          logger.debug({ name: toolMeta.name, rawArgs, parsedArgs }, 'Tool call args');
           
           // Call the decorated method
           const result = await instance[toolMeta.methodName](parsedArgs);
+          logger.debug({ name: toolMeta.name, resultType: typeof result }, 'Tool call result');
           
           return {
             content: [
               {
                 type: "text",
-                text: typeof result === 'string' ? result : JSON.stringify(result),
+                text: (() => {
+                  if (typeof result === 'string') return result;
+                  if (typeof result === 'number') return Number.isNaN(result) ? 'NaN' : result.toString();
+                  if (result === null) return 'null';
+                  if (typeof result === 'undefined') return 'undefined';
+                  try { return JSON.stringify(result); } catch { return String(result); }
+                })(),
               },
             ],
           };
@@ -437,6 +603,9 @@ export class FastMCP {
  */
 function zodToJsonSchema(schema: z.ZodSchema<any>): any {
   // Simple conversion - in a production environment you might want to use a library like zod-to-json-schema
+  if (schema instanceof z.ZodAny) {
+    return { type: 'object', additionalProperties: true };
+  }
   if (schema instanceof z.ZodObject) {
     const shape = schema.shape;
     const properties: any = {};
