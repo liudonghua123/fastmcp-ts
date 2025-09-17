@@ -8,7 +8,7 @@ A TypeScript framework for building Model Context Protocol (MCP) servers with de
 - 🚀 **Multiple Transport Types** - Support for stdio, SSE, and streamable HTTP transports
 - 📝 **TypeScript First** - Built with TypeScript for excellent type safety and IntelliSense
 - 🔧 **Zod Integration** - Built-in parameter validation using Zod schemas
-- 🌐 **Express Integration** - Easy integration with Express.js for HTTP-based servers
+- 🌐 **HTTP Integrations** - Works with Express, Koa v3, hapi, AdonisJS, NestJS
 - 📝 **Doc-Driven Metadata (TSDoc-like)** - Infer tool description and parameter schema from doc comments when decorator options are omitted
 - ⚖️ **Decorator Precedence** - Decorator options always override doc comments for the same fields
 - 🧪 **DX-Friendly Dev/Test** - Run tests with tsx against TypeScript sources via an alias; build src and tests into a flat `dist/`
@@ -63,10 +63,10 @@ server.register(new MathTools());
 await server.serve(); // stdio by default
 ```
 
-### 2. HTTP Server with Express
+### 2. HTTP Server with Express (optional)
 
 ```typescript
-import express from 'express';
+import express from 'express'; // optional, for HTTP example only
 import { FastMCP, tool } from 'fastmcp-ts';
 import { z } from 'zod';
 
@@ -109,6 +109,142 @@ app.post('/mcp', async (req, res) => {
 app.listen(3000, () => {
   console.log('MCP server running on port 3000');
 });
+```
+
+### 3. HTTP Server with Koa v3 (optional)
+
+```typescript
+import Koa from 'koa';
+import bodyParser from 'koa-bodyparser';
+import Router from '@koa/router';
+import { FastMCP, tool } from 'fastmcp-ts';
+import { z } from 'zod';
+
+class MyTools {
+  @tool({
+    name: 'greet',
+    parameters: z.object({ name: z.string() })
+  })
+  async greet({ name }: { name: string }) { return `Hello, ${name}!`; }
+}
+
+const server = new FastMCP({ name: 'greeting-server', version: '1.0.0' });
+server.register(new MyTools());
+
+await server.serve(FastMCP.createStreamableHTTPConfig({ sessionIdGenerator: undefined }));
+const transport = server.getTransport();
+
+const app = new Koa();
+const router = new Router();
+app.use(bodyParser());
+
+router.post('/mcp', async (ctx) => {
+  await transport.handleRequest(
+    // Express-like shim: req, res, body
+    ctx.req as any,
+    ctx.res as any,
+    ctx.request.body
+  );
+  // Transport writes to res directly; ensure Koa doesn’t re-send
+  ctx.respond = false;
+});
+
+app.use(router.routes());
+app.use(router.allowedMethods());
+app.listen(3000);
+```
+
+### 4. HTTP Server with hapi (optional)
+
+```typescript
+import Hapi from '@hapi/hapi';
+import { FastMCP, tool } from 'fastmcp-ts';
+import { z } from 'zod';
+
+class MyTools {
+  @tool({ name: 'greet', parameters: z.object({ name: z.string() }) })
+  async greet({ name }: { name: string }) { return `Hello, ${name}!`; }
+}
+
+const server = new FastMCP({ name: 'greeting-server', version: '1.0.0' });
+server.register(new MyTools());
+await server.serve(FastMCP.createStreamableHTTPConfig({ sessionIdGenerator: undefined }));
+const transport = server.getTransport();
+
+const app = Hapi.server({ port: 3000, host: 'localhost' });
+app.route({
+  method: 'POST',
+  path: '/mcp',
+  options: { payload: { parse: true, output: 'data' } },
+  handler: async (request, h) => {
+    const res = request.raw.res;
+    await transport.handleRequest(request.raw.req as any, res as any, request.payload);
+    return h.abandon; // response already written
+  },
+});
+
+await app.start();
+```
+
+### 5. HTTP Server with AdonisJS (optional)
+
+```typescript
+// start/routes.ts
+import Route from '@ioc:Adonis/Core/Route';
+import { FastMCP, tool } from 'fastmcp-ts';
+import { z } from 'zod';
+
+class MyTools {
+  @tool({ name: 'greet', parameters: z.object({ name: z.string() }) })
+  async greet({ name }: { name: string }) { return `Hello, ${name}!`; }
+}
+
+const mcp = new FastMCP({ name: 'greeting-server', version: '1.0.0' });
+mcp.register(new MyTools());
+await mcp.serve(FastMCP.createStreamableHTTPConfig({ sessionIdGenerator: undefined }));
+const transport = mcp.getTransport();
+
+Route.post('/mcp', async ({ request, response }) => {
+  await transport.handleRequest(request.request as any, response.response as any, request.body());
+});
+```
+
+### 6. HTTP Server with NestJS (optional)
+
+```typescript
+import { Controller, Post, Req, Res } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import { Module } from '@nestjs/common';
+import { FastMCP, tool } from 'fastmcp-ts';
+import { z } from 'zod';
+
+class MyTools {
+  @tool({ name: 'greet', parameters: z.object({ name: z.string() }) })
+  async greet({ name }: { name: string }) { return `Hello, ${name}!`; }
+}
+
+const mcp = new FastMCP({ name: 'greeting-server', version: '1.0.0' });
+mcp.register(new MyTools());
+await mcp.serve(FastMCP.createStreamableHTTPConfig({ sessionIdGenerator: undefined }));
+const transport = mcp.getTransport();
+
+@Controller()
+class AppController {
+  @Post('mcp')
+  async mcp(@Req() req: any, @Res() res: any) {
+    await transport.handleRequest(req, res, req.body);
+  }
+}
+
+@Module({ controllers: [AppController] })
+class AppModule {}
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  await app.listen(3000);
+}
+
+bootstrap();
 ```
 
 ## API Reference
@@ -417,7 +553,12 @@ npm start
 - `@modelcontextprotocol/sdk` - Core MCP SDK
 - `zod` - Schema validation
 - `reflect-metadata` - Decorator metadata support
-- `express` - HTTP server framework (for HTTP transport)
+
+HTTP frameworks are optional and only needed for examples/tests:
+- `express`, `koa`, `@koa/router`, `koa-bodyparser`
+- `@hapi/hapi`
+- `@adonisjs/*` (depending on your app)
+- `@nestjs/common`, `@nestjs/core` (if using NestJS)
 
 ## License
 
