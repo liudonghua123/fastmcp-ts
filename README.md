@@ -47,7 +47,7 @@ class MathTools {
    * @returns Product of a and b
    */
   @tool({
-    name: 'multiply1',            // decorator overrides doc name
+    name: 'product',              // decorator overrides doc name
     parameters: z.object({        // decorator overrides doc-inferred params
       a: z.number(),
       b: z.number(),

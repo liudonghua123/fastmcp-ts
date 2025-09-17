@@ -22,25 +22,14 @@ class SimpleMcp {
    * @param b Second number
    * @returns Multiply of a and b
    */
-  @tool()
-  async multiply({ a, b }: { a: number; b: number }) {
-    return a * b;
-  }
-
-  /**
-   * Multiplies two numbers.
-   * @param a First number
-   * @param b Second number
-   * @returns Product of a and b
-   */
   @tool({
-    name: 'multiply1',
+    name: 'product',
     parameters: z.object({
       a: z.number(),
       b: z.number(),
     }),
   })
-  async multiplyConfigured({ a, b }: { a: number; b: number }) {
+  async multiply({ a, b }: { a: number; b: number }) {
     return a * b;
   }
 }
