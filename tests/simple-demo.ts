@@ -1,30 +1,70 @@
-import { FastMCP, tool } from './index.js';
+import { FastMCP, tool } from '#fastmcp';
 import { z } from 'zod';
 import express from 'express';
+import { GreetingMCP } from './mcp1.js';
 import type { Request, Response } from 'express';
 
 class SimpleMcp {
+  /**
+   * Add two numbers together.
+   * @param a First number
+   * @param b Second number
+   * @returns Sum of a and b
+   */
+  @tool()
+  async add({ a, b }: { a: number; b: number }) {
+    return a + b;
+  }
+  
+  /**
+   * Multiply two numbers together.
+   * @param a First number
+   * @param b Second number
+   * @returns Multiply of a and b
+   */
+  @tool()
+  async multiply({ a, b }: { a: number; b: number }) {
+    return a * b;
+  }
+
+  /**
+   * Multiplies two numbers.
+   * @param a First number
+   * @param b Second number
+   * @returns Product of a and b
+   */
   @tool({
-    name: "add",
-    description: "Add two numbers",
+    name: 'multiply1',
     parameters: z.object({
       a: z.number(),
       b: z.number(),
     }),
   })
-  async add({ a, b }: { a: number; b: number }) {
-    return a + b;
+  async multiplyConfigured({ a, b }: { a: number; b: number }) {
+    return a * b;
   }
 }
 
-const simpleMcp = new SimpleMcp();
+class OtherMap {
+
+  /**
+   * Simple other tool
+   * @returns a string
+   */
+  @tool()
+  async other() {
+    return "other";
+  }
+}
 
 const server = new FastMCP({
   name: "simple-math-server",
   version: "1.0.0"
 });
 
-server.register(simpleMcp);
+server.register(new SimpleMcp());
+server.register(new OtherMap());
+server.register(new GreetingMCP());
 // Create and configure the transport for StreamableHTTP
 const transportConfig = FastMCP.createStreamableHTTPConfig({
   sessionIdGenerator: undefined
