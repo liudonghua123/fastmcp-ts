@@ -1,5 +1,7 @@
 # FastMCP-TS
 
+English | [简体中文](./README.zh-CN.md)
+
 A TypeScript framework for building Model Context Protocol (MCP) servers with decorator-based syntax. This package simplifies the creation of MCP servers by providing intuitive decorators for defining tools, prompts, and resources.
 
 ## Features
