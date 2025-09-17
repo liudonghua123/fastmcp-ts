@@ -1,7 +1,6 @@
 import { FastMCP, tool } from '#fastmcp';
 import { z } from 'zod';
 import express from 'express';
-import { GreetingMCP } from './mcp1.js';
 import type { Request, Response } from 'express';
 
 class SimpleMcp {
@@ -53,7 +52,7 @@ const server = new FastMCP({
 
 server.register(new SimpleMcp());
 server.register(new OtherMap());
-server.register(new GreetingMCP());
+
 // Create and configure the transport for StreamableHTTP
 const transportConfig = FastMCP.createStreamableHTTPConfig({
   sessionIdGenerator: undefined
